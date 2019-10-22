@@ -29,18 +29,20 @@ func checkError(err error) {
 
 const VendorJuniper = 0xa4c
 const VendorTGC = 0x5597
-const Juniper1 = ((VendorJuniper << 8) | 1)
+const Juniper1 = (VendorJuniper << 8) | 1
 
-const IFTTypeAuthResponse = 6
-
-const EAPRequest = 1
-const EAPResponse = 2
+const EAPRequest uint8 = 1
+const EAPResponse uint8 = 2
 const EAPTypeTTLS = 0x15
 
 func isTTLS(buf []byte) bool {
 
+	if len(buf) < 0x18 {
+		return false
+	}
+
 	ttlsStart := []byte{0x00, 0x00, 0x55, 0x97, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00}
-	if len(buf) < len(ttlsStart) {
+	if buf[0x18] != EAPTypeTTLS {
 		return false
 	}
 
