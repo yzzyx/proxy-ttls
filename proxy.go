@@ -33,6 +33,7 @@ const Juniper1 = ((VendorJuniper << 8) | 1)
 
 const IFTTypeAuthResponse = 6
 
+const EAPRequest = 1
 const EAPResponse = 2
 const EAPTypeTTLS = 0x15
 

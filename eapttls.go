@@ -1,17 +1,68 @@
 package main
 
 import (
+	"encoding/binary"
 	"net"
 	"time"
 )
 
+const ExpandedJuniper uint32 = (uint32(EapTypeExpandedTypes) << 24) | VendorJuniper
+
+// communicationDir defines the direction of the communication
+type communicationDir int
+
+// Constants used to keep track of communication direction
+const (
+	DirClientToServer communicationDir = iota
+	DirServerToClient
+)
+
 type EAPTTLSConn struct {
-	conn net.Conn
+	conn     net.Conn
+	eapIdent uint8
+
+	direction communicationDir
+}
+
+// beUint32 converts a uint32 to []byte in big endian order
+func beUint32(v uint32) []byte {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, v)
+	return buf
+}
+
+func CreateIFTHeader(vendor uint32, iftType uint32) []byte {
+	buf := make([]byte, 16)
+	binary.BigEndian.PutUint32(buf[:], vendor)
+	binary.BigEndian.PutUint32(buf[4:], iftType)
+	binary.BigEndian.PutUint32(buf[8:], 0)
+	binary.BigEndian.PutUint32(buf[12:], 0)
+	return buf
+}
+
+// CreateEAPHeader creates a new EAP header.
+// NOTE: length is the length of the DATA that comes _after_ the EAP header.
+// The size of the EAP header will automatically be added the the length.
+func CreateEAPHeader(code uint8, ident uint8, eapType EapType, subtype uint32, length uint16) []byte {
+	buf := make([]byte, 12)
+
+	buf[0] = code
+	buf[1] = ident
+
+	if eapType == EapTypeExpandedTypes {
+		binary.BigEndian.PutUint16(buf[2:], length+12)
+		binary.BigEndian.PutUint32(buf[4:], ExpandedJuniper)
+		binary.BigEndian.PutUint32(buf[8:], subtype)
+		return buf[0:12]
+	}
+
+	binary.BigEndian.PutUint16(buf[2:], length+5)
+	buf[4] = uint8(eapType)
+	return buf[0:5]
 }
 
 // Read reads data from the connection
 func (c *EAPTTLSConn) Read(b []byte) (n int, err error) {
-
 	data := make([]byte, 16384)
 	nb, err := c.conn.Read(data)
 	if err != nil {
@@ -62,6 +113,17 @@ func (c *EAPTTLSConn) Read(b []byte) (n int, err error) {
 // Write writes data to the connection
 func (c *EAPTTLSConn) Write(b []byte) (n int, err error) {
 
+	// On the client side
+	code := EAPResponse
+	if c.direction == DirServerToClient {
+		code = EAPRequest
+	}
+
+	packet := CreateIFTHeader(VendorTGC, IFTTypeAuthResponse)
+	packet = append(packet, beUint32(Juniper1)...)
+	packet = append(packet, CreateEAPHeader(code, c.eapIdent, EAPTypeTTLS, 0, uint16(len(b)+1))...)
+	packet = append(packet, 0x00) // EAP-TTLS flags
+	packet = append(packet, b...)
 	/*
 		buf_append_ift_hdr(buf, VENDOR_TCG, IFT_CLIENT_AUTH_RESPONSE);
 		buf_append_be32(buf, JUNIPER_1); // IF-T/TLS Auth Type
