@@ -16,9 +16,18 @@ type communicationDir int
 
 // Constants used to keep track of communication direction
 const (
-	DirClientToServer communicationDir = iota
-	DirServerToClient
+	ClientToServer communicationDir = iota
+	ServerToClient
 )
+
+func (d communicationDir) String() string {
+	smap := map[communicationDir]string{
+		ClientToServer: "client->server",
+		ServerToClient: "server->client",
+	}
+
+	return smap[d]
+}
 
 const IFTClientAuthRequest = 3
 const IFTClientAuthSelection = 4
@@ -258,7 +267,7 @@ func (c *EAPTTLSConn) Write(b []byte) (n int, err error) {
 
 	// On the client side
 	code := EAPResponse
-	if c.direction == DirServerToClient {
+	if c.direction == ServerToClient {
 		code = EAPRequest
 	}
 	/*

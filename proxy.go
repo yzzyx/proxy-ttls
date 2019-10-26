@@ -20,13 +20,6 @@ var keylogFilename = flag.String("keylog", "", "write tls keys to file")
 var outputFilename = flag.String("output", "", "set output file")
 var forwardAddress = flag.String("forward", "", "forward requests to")
 
-func checkError(err error) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Fatal error: %s", err.Error())
-		os.Exit(1)
-	}
-}
-
 const VendorJuniper = 0xa4c
 const VendorTGC = 0x5597
 const Juniper1 = (VendorJuniper << 8) | 1
@@ -35,7 +28,7 @@ const EAPRequest uint8 = 1
 const EAPResponse uint8 = 2
 const EAPTypeTTLS = 0x15
 
-func isTTLS(buf []byte) bool {
+func isStartTTLS(buf []byte) bool {
 
 	if len(buf) < 0x18 {
 		return false
@@ -50,61 +43,56 @@ func isTTLS(buf []byte) bool {
 }
 
 /* slower, by we can print/log everything */
-func myrawcopy(dst, src net.Conn, direction string) (written int64, err error) {
+func rawCopy(dst, src net.Conn, direction communicationDir) (err error) {
 	buf := make([]byte, 32*1024)
-	realcert := []byte("bdc6804f38fe5ea721f46c2ad24c137c")
-	mycert := []byte("4cfb34cdb3813186e7d76c4a51a90941")
-	//      realcert := []byte("Upgrade: IF-T/TLS 1.0")
-	//      mycert := []byte("xxgrade: xx-T/TLS 1.0")
 	for {
-		nr, er := src.Read(buf)
+		nr, err := src.Read(buf)
 		if nr > 0 {
-			buf := bytes.Replace(buf, realcert, mycert, 1)
-			fmt.Fprintf(outputWriter, "Packet %s:\n%s", direction, hex.Dump(buf[0:nr]))
-			if isTTLS(buf[:]) {
+			_, _ = fmt.Fprintf(outputWriter, "Packet %s:\n%s", direction, hex.Dump(buf[0:nr]))
+
+			if isStartTTLS(buf) {
 
 			}
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
+
+			nw, err := dst.Write(buf[0:nr])
+			if err != nil {
+				return err
 			}
-			if ew != nil {
-				err = ew
-				break
-			}
+
 			if nr != nw {
-				err = io.ErrShortWrite
-				break
+				return io.ErrShortWrite
 			}
 		}
-		if er == io.EOF {
-			break
-		}
-		if er != nil {
-			err = er
-			break
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
 		}
 	}
-	return written, err
 }
 
-func myiocopy(dst net.Conn, src net.Conn, direction string) {
-	myrawcopy(dst, src, direction)
-	//io.Copy(dst,src);
-	dst.Close()
-	src.Close()
+func ioCopy(dst net.Conn, src net.Conn, direction communicationDir) {
+	err := rawCopy(dst, src, direction)
+	if err != nil {
+		fmt.Fprintf(outputWriter, "%s: error from rawCopy: %s\n", direction, err)
+	}
 }
 
-func handleclient(c net.Conn) {
+func handleClient(clientConn net.Conn) {
+	defer clientConn.Close()
+
 	config := tls.Config{KeyLogWriter: keylogWriter, InsecureSkipVerify: true}
-	conn, err := tls.Dial("tcp", *forwardAddress, &config)
-	checkError(err)
+	serverConn, err := tls.Dial("tcp", *forwardAddress, &config)
+	if err != nil {
+		fmt.Fprintf(outputWriter, "error initializing TLS connection: %s\n", err)
+		return
+	}
 
-	go myiocopy(conn, c, "client->server")
+	defer serverConn.Close()
 
-	myrawcopy(c, conn, "server->client")
-	c.Close()
-	conn.Close()
+	go ioCopy(serverConn, clientConn, ClientToServer)
+	ioCopy(clientConn, serverConn, ServerToClient)
 }
 
 func main() {
@@ -162,6 +150,6 @@ func main() {
 		}
 		defer conn.Close()
 		log.Printf("server: accepted from %s", conn.RemoteAddr())
-		go handleclient(conn)
+		go handleClient(conn)
 	}
 }
