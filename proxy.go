@@ -42,26 +42,51 @@ func isStartTTLS(buf []byte) bool {
 	return bytes.Compare(buf[0:len(ttlsStart)], ttlsStart) == 0
 }
 
-/* slower, by we can print/log everything */
-func rawCopy(dst, src net.Conn, direction communicationDir) (err error) {
+type Proxy struct {
+	clientConn net.Conn
+	serverConn net.Conn
+
+	// Channels for data received from client or server
+	clientCh chan []byte
+	serverCh chan []byte
+
+	done chan struct{}
+}
+
+// Reader forwards all data from client to clientCh, or from server to serverCh
+func NewProxy(clientConn, serverConn net.Conn) *Proxy {
+	p := &Proxy{
+		clientConn: clientConn,
+		serverConn: serverConn,
+		clientCh:   make(chan []byte),
+		serverCh:   make(chan []byte),
+		done:       make(chan struct{}),
+	}
+
+	return p
+}
+
+// Reader forwards all data from client to clientCh, or from server to serverCh
+func (p *Proxy) Reader(direction communicationDir) error {
+	var src net.Conn
+	var ch chan []byte
+
+	switch direction {
+	case ClientToServer:
+		src = p.clientConn
+		ch = p.clientCh
+	case ServerToClient:
+		src = p.serverConn
+		ch = p.serverCh
+	}
+
+	defer close(ch)
+
 	buf := make([]byte, 32*1024)
 	for {
 		nr, err := src.Read(buf)
 		if nr > 0 {
-			_, _ = fmt.Fprintf(outputWriter, "Packet %s:\n%s", direction, hex.Dump(buf[0:nr]))
-
-			if isStartTTLS(buf) {
-
-			}
-
-			nw, err := dst.Write(buf[0:nr])
-			if err != nil {
-				return err
-			}
-
-			if nr != nw {
-				return io.ErrShortWrite
-			}
+			ch <- buf[0:nr]
 		}
 		if err != nil {
 			if err == io.EOF {
@@ -72,27 +97,74 @@ func rawCopy(dst, src net.Conn, direction communicationDir) (err error) {
 	}
 }
 
-func ioCopy(dst net.Conn, src net.Conn, direction communicationDir) {
-	err := rawCopy(dst, src, direction)
-	if err != nil {
-		fmt.Fprintf(outputWriter, "%s: error from rawCopy: %s\n", direction, err)
+// CopyData reads data from the client and server channels and writes them to the correct connection
+func (p *Proxy) CopyData() error {
+	useTTLS := false
+
+	for {
+		var buf []byte
+		var dst net.Conn
+		var direction communicationDir
+
+		select {
+		case buf = <-p.clientCh:
+			dst = p.serverConn
+			direction = ClientToServer
+			if useTTLS {
+
+			}
+		case buf = <-p.serverCh:
+			dst = p.clientConn
+			direction = ServerToClient
+
+			if useTTLS {
+
+			}
+		case <-p.done:
+			return nil
+		}
+
+		_, _ = fmt.Fprintf(outputWriter, "Packet %s:\n%s", direction, hex.Dump(buf))
+
+		nb, err := dst.Write(buf)
+		if err != nil {
+			return err
+		}
+
+		if nb != len(buf) {
+			return io.ErrShortWrite
+		}
 	}
 }
 
-func handleClient(clientConn net.Conn) {
+func handleClient(clientConn net.Conn) error {
 	defer clientConn.Close()
 
 	config := tls.Config{KeyLogWriter: keylogWriter, InsecureSkipVerify: true}
 	serverConn, err := tls.Dial("tcp", *forwardAddress, &config)
 	if err != nil {
-		fmt.Fprintf(outputWriter, "error initializing TLS connection: %s\n", err)
-		return
+		err = fmt.Errorf("error initializing TLS connection: %w", err)
+		return err
 	}
-
 	defer serverConn.Close()
 
-	go ioCopy(serverConn, clientConn, ClientToServer)
-	ioCopy(clientConn, serverConn, ServerToClient)
+	p := NewProxy(clientConn, serverConn)
+	go func() {
+		err = p.Reader(ClientToServer)
+		if err != nil {
+			fmt.Fprintf(outputWriter, "%s: error from reader: %s\n", ClientToServer, err)
+		}
+	}()
+
+	go func() {
+		err = p.Reader(ServerToClient)
+		if err != nil {
+			fmt.Fprintf(outputWriter, "%s: error from reader: %s\n", ServerToClient, err)
+		}
+	}()
+
+	err = p.CopyData()
+	return err
 }
 
 func main() {
@@ -150,6 +222,11 @@ func main() {
 		}
 		defer conn.Close()
 		log.Printf("server: accepted from %s", conn.RemoteAddr())
-		go handleClient(conn)
+		go func() {
+			err = handleClient(conn)
+			if err != nil {
+				fmt.Fprintf(outputWriter, "error from handleClient: %s\n", err)
+			}
+		}()
 	}
 }
