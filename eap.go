@@ -1,129 +1,150 @@
-// from https://github.com/zenreach/go-radiuslib/blob/master/eap.go
 package main
 
 import (
 	"encoding/binary"
-	"fmt"
-	"strconv"
+	"errors"
 )
 
-type EapCode uint8
+// EAP errors
+var (
+	ErrEAPTooShort       = errors.New("invalid EAP packet - too short")
+	ErrEAPLengthMismatch = errors.New("invalid EAP packet - length header value does not match received data")
+)
 
+// EAP codes
 const (
-	EapCodeRequest  EapCode = 1
-	EapCodeResponse EapCode = 2
-	EapCodeSuccess  EapCode = 3
-	EapCodeFailure  EapCode = 4
+	EAPRequest  uint8 = 1
+	EAPResponse uint8 = 2
 )
 
-func (c EapCode) String() string {
-	switch c {
-	case EapCodeRequest:
-		return "Request"
-	case EapCodeResponse:
-		return "Response"
-	case EapCodeSuccess:
-		return "Success"
-	case EapCodeFailure:
-		return "Failure"
-	default:
-		return "unknow EapCode " + strconv.Itoa(int(c))
-	}
-}
-
-type EapType uint8
-
+// EAP types
 const (
-	EapTypeIdentity         EapType = 1
-	EapTypeNotification     EapType = 2
-	EapTypeNak              EapType = 3 //Response only
-	EapTypeMd5Challenge     EapType = 4
-	EapTypeOneTimePassword  EapType = 5 //otp
-	EapTypeGenericTokenCard EapType = 6 //gtc
-	EapTypeMSCHAPV2         EapType = 26
-	EapTypeExpandedTypes    EapType = 254
-	EapTypeExperimentalUse  EapType = 255
+	EAPTypeTTLS = 0x15
 )
 
-func (c EapType) String() string {
-	switch c {
-	case EapTypeIdentity:
-		return "Identity"
-	case EapTypeNotification:
-		return "Notification"
-	case EapTypeNak:
-		return "Nak"
-	case EapTypeMd5Challenge:
-		return "Md5Challenge"
-	case EapTypeOneTimePassword:
-		return "OneTimePassword"
-	case EapTypeGenericTokenCard:
-		return "GenericTokenCard"
-	case EapTypeMSCHAPV2:
-		return "MSCHAPV2"
-	case EapTypeExpandedTypes:
-		return "ExpandedTypes"
-	case EapTypeExperimentalUse:
-		return "ExperimentalUse"
-	default:
-		return "unknow EapType " + strconv.Itoa(int(c))
+// EAPPacket describes a EAP-TTLS packet as seen in RFC-5281:
+//
+// The EAP-TTLS packet format is shown below.  The fields are
+// transmitted left to right.
+//
+// 0                   1                   2                   3
+// 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |     Code      |   Identifier  |            Length             |
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+// |     Type      |     Flags     |        Message Length
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//          Message Length         |             Data...
+// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+// Code
+// 1 for request, 2 for response.
+//
+// Identifier
+// The Identifier field is one octet and aids in matching responses
+// with requests.  The Identifier field MUST be changed for each
+// request packet and MUST be echoed in each response packet.
+//
+// Length
+// The Length field is two octets and indicates the number of octets
+// in the entire EAP packet, from the Code field through the Data
+// field.
+//
+// Type
+//
+//
+//
+// Flags
+// 0   1   2   3   4   5   6   7
+// +---+---+---+---+---+---+---+---+
+// | L | M | S | R | R |     V     |
+// +---+---+---+---+---+---+---+---+
+//
+// L = Length included
+// M = More fragments
+// S = Start
+// R = Reserved
+// V = Version (000 for EAP-TTLSv0)
+//
+// The L bit is set to indicate the presence of the four-octet TLS
+// Message Length field.  The M bit indicates that more fragments are
+// to come.  The S bit indicates a Start message.  The V field is set
+// to the version of EAP-TTLS, and is set to 000 for EAP-TTLSv0.
+//
+// Message Length
+// The Message Length field is four octets, and is present only if
+// the L bit is set.  This field provides the total length of the raw
+// data message sequence prior to fragmentation.
+//
+// Data
+// For all packets other than a Start packet, the Data field consists
+// of the raw TLS message sequence or fragment thereof.  For a Start
+// packet, the Data field may optionally contain an AVP sequence.
+type EAPPacket struct {
+	Code          uint8 // 1 for request, 2 for response
+	Identifier    uint8
+	Length        uint16 // Length is the length of Data + EAP Header
+	Type          uint8
+	Flags         uint8
+	MessageLength uint32
+	Data          []byte
+}
+
+// Encode creates a byte-array from a given EAP packet
+func (p *EAPPacket) Encode() []byte {
+	buf := make([]byte, 12)
+
+	buf[0] = p.Code
+	buf[1] = p.Identifier
+	buf[4] = p.Type
+	buf[5] = p.Flags
+	p.Length = uint16(len(p.Data) + 6)
+
+	// Is total message length included?
+	if p.Flags&0x80 > 0 {
+		p.Length += 4
+		binary.BigEndian.PutUint16(buf[2:], p.Length)
+		binary.BigEndian.PutUint32(buf[6:], p.MessageLength)
+		return append(buf[0:10], p.Data...)
 	}
+
+	binary.BigEndian.PutUint16(buf[2:], p.Length)
+	return append(buf[0:5], p.Data...)
 }
 
-type EapPacket struct {
-	Code       EapCode
-	Identifier uint8
-	Type       EapType
-	Data       []byte
-}
-
-func (a *EapPacket) String() string {
-	return fmt.Sprintf("Eap Code:%s id:%d Type:%s Data:[%s]", a.Code.String(), a.Identifier, a.Type.String(), a.valueString())
-}
-
-func (a *EapPacket) valueString() string {
-	switch a.Type {
-	case EapTypeIdentity:
-		return fmt.Sprintf("%#v", string(a.Data)) //应该是字符串,但是也有可能被搞错
-		//case EapTypeMSCHAPV2:
-		//mcv, err := MsChapV2PacketFromEap(a)
-		//if err != nil {
-		//	return err.Error()
-		//}
-		//return mcv.String()
+// EAPDecode decodes a byte array into a EAP Packet
+func EAPDecode(buf []byte) (*EAPPacket, error) {
+	if len(buf) < 6 {
+		return nil, ErrEAPTooShort
 	}
-	return fmt.Sprintf("%#v", a.Data)
+
+	p := &EAPPacket{}
+	p.Code = buf[0]
+	p.Identifier = buf[1]
+	p.Length = binary.BigEndian.Uint16(buf[2:])
+	p.Type = buf[4]
+	p.Flags = buf[5]
+
+	if p.Flags&0x80 > 0 {
+		p.MessageLength = binary.BigEndian.Uint32(buf[6:])
+		p.Data = buf[10:]
+	} else {
+		p.Data = buf[6:]
+	}
+
+	if int(p.Length) != len(buf) {
+		return nil, ErrEAPLengthMismatch
+	}
+
+	return p, nil
 }
 
-func (a *EapPacket) Copy() *EapPacket {
-	eap := *a
-	eap.Data = append([]byte(nil), a.Data...)
-	return &eap
-}
-
-func (a *EapPacket) Encode() (b []byte) {
-	b = make([]byte, len(a.Data)+5)
-	b[0] = byte(a.Code)
-	b[1] = byte(a.Identifier)
-	binary.BigEndian.PutUint16(b[2:4], uint16(len(a.Data)+5))
-	b[4] = byte(a.Type)
-	copy(b[5:], a.Data)
-	return b
-}
-
-func EapDecode(b []byte) (eap *EapPacket, err error) {
-	if len(b) < 5 {
-		return nil, fmt.Errorf("[EapDecode] protocol error input too small 1")
+func NewEAP(code, identifier, eapType, flags uint8, data []byte) *EAPPacket {
+	return &EAPPacket{
+		Code:       code,
+		Identifier: identifier,
+		Type:       eapType,
+		Flags:      flags,
+		Data:       data,
 	}
-	length := binary.BigEndian.Uint16(b[2:4])
-	if len(b) < int(length) {
-		return nil, fmt.Errorf("[EapDecode] protocol error input too small 2")
-	}
-	eap = &EapPacket{
-		Code:       EapCode(b[0]),
-		Identifier: uint8(b[1]),
-		Type:       EapType(b[4]),
-		Data:       b[5:length],
-	}
-	return eap, nil
 }
