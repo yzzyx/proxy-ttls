@@ -109,7 +109,7 @@ func (p *EAPPacket) Encode() []byte {
 	}
 
 	binary.BigEndian.PutUint16(buf[2:], p.Length)
-	return append(buf[0:5], p.Data...)
+	return append(buf[0:6], p.Data...)
 }
 
 // EAPDecode decodes a byte array into a EAP Packet

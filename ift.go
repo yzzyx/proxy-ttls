@@ -75,7 +75,7 @@ const (
 // response. For example, this field is included in the IF-T Error Message so the recipient can determine which message
 // sent caused the error. The Message Identifier MUST be a monotonically increasing counter starting at zero indicating
 // the number of the messages the sender has transmitted over the TLS session.  It is possible that a busy or long lived
-// session might exceed 232-1 messages sent, so the message sender MUST roll over to zero upon reaching the 232nd
+// session might exceed 2^32-1 messages sent, so the message sender MUST roll over to zero upon reaching the 2^32nd
 // message, thus restarting the increasing counter. During a rollover, it is feasible that the message recipient could
 // be confused if it keeps track of every previously received Message Identifier, so recipients MUST be able to handle
 // roll over situations without generating errors.
@@ -107,7 +107,7 @@ func (p *IFTPacket) Encode() []byte {
 func (p *IFTPacket) IsValidAuth() bool {
 	if p.Length < 0x14 ||
 		p.Vendor != VendorTGC ||
-		p.Type != IFTClientAuthChallenge ||
+		(p.Type != IFTClientAuthChallenge && p.Type != IFTClientAuthResponse) ||
 		binary.BigEndian.Uint32(p.Data) != Juniper1 {
 		return false
 	}

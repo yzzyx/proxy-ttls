@@ -2,10 +2,15 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+)
+
+var (
+	ErrIdentChannelFull = errors.New("identification channel is full, too many packets waiting")
 )
 
 // communicationDir defines the direction of the communication
@@ -34,15 +39,18 @@ func (d communicationDir) String() string {
 type IdentInfo struct {
 	EAPIdentifier uint8
 	EAPFlags      uint8
-	IFTIdentifier uint32
 }
 
 type EAPTTLSConn struct {
 	net.Conn
 
-	writeIdentCh <-chan IdentInfo // Channel for identifiers that should be used in Write()
-	readIdentCh  chan<- IdentInfo // Channel that we add identifiers to in Read()
-	direction    communicationDir
+	writeIdentCh  <-chan IdentInfo // Channel for identifiers that should be used in Write()
+	readIdentCh   chan<- IdentInfo // Channel that we add identifiers to in Read()
+	direction     communicationDir
+	IFTIdentifier uint32
+
+	hasData bool
+	data    []byte
 }
 
 // beUint32 converts a uint32 to []byte in big endian order
@@ -61,6 +69,17 @@ func (c *EAPTTLSConn) Read(b []byte) (n int, err error) {
 		expectedEapCode = EAPRequest
 	case ServerToClient:
 		expectedEapCode = EAPResponse
+	}
+
+	if c.hasData {
+		nb := copy(b, c.data)
+		fmt.Fprintf(outputWriter, "still has data, returned %d bytes\n", nb)
+		if nb < len(c.data) {
+			c.data = c.data[nb:]
+		} else {
+			c.hasData = false
+		}
+		return nb, nil
 	}
 
 	packet := make([]byte, 16384)
@@ -87,6 +106,8 @@ func (c *EAPTTLSConn) Read(b []byte) (n int, err error) {
 		return 0, fmt.Errorf("expected IF-T to contain value 0x%x, but got 0x%x", Juniper1, val)
 	}
 
+	fmt.Fprintf(outputWriter, "%s Read [EAPTTLS]\n%s", c.direction, hex.Dump(packet))
+
 	// ...followed by a EAP packet
 	eap, err := EAPDecode(ift.Data[4:])
 	if err != nil {
@@ -101,18 +122,27 @@ func (c *EAPTTLSConn) Read(b []byte) (n int, err error) {
 		return 0, fmt.Errorf("unexpected EAP type %d (expected %d)", eap.Type, EAPTypeTTLS)
 	}
 
-	if len(b) < len(eap.Data) {
-		return 0, io.ErrShortBuffer
-	}
-
 	ii := IdentInfo{
 		EAPIdentifier: eap.Identifier,
 		EAPFlags:      eap.Flags,
-		IFTIdentifier: ift.Identifier,
 	}
-	c.readIdentCh <- ii
 
+	// Add identifier info to channel
+	select {
+	case c.readIdentCh <- ii:
+	// noop
+	default:
+		return 0, ErrIdentChannelFull
+	}
+
+	fmt.Fprintf(outputWriter, "%s:: read %+v\n", c.direction, ii)
 	nb = copy(b, eap.Data)
+	if nb < len(eap.Data) {
+		fmt.Fprintf(outputWriter, "len(b): %d, len(eap.Data): %d, keeping data in buffer\n", len(b), len(eap.Data))
+		c.data = eap.Data[nb:]
+		c.hasData = true
+	}
+
 	return nb, nil
 }
 
@@ -120,6 +150,10 @@ func (c *EAPTTLSConn) Read(b []byte) (n int, err error) {
 func (c *EAPTTLSConn) Write(b []byte) (n int, err error) {
 	var eapCode uint8
 	var iftCode uint32
+
+	if len(b) == 0 {
+		return 0, nil
+	}
 
 	// If we're acting as a client to the server,
 	// we'll use the eapIdent the server last gave us, and set th
@@ -133,6 +167,7 @@ func (c *EAPTTLSConn) Write(b []byte) (n int, err error) {
 		iftCode = IFTClientAuthResponse
 	}
 
+	fmt.Fprintf(outputWriter, "%s:: write waiting for idents before writing %d bytes\n", c.direction, len(b))
 	idents := <-c.writeIdentCh
 	/*
 
@@ -215,12 +250,19 @@ func (c *EAPTTLSConn) Write(b []byte) (n int, err error) {
 									   	packet = append(packet, b...)
 	*/
 
+	idents.EAPFlags = idents.EAPFlags & 0x40
 	// First, wrap data in a EAP packet
 	eap := NewEAP(eapCode, idents.EAPIdentifier, EAPTypeTTLS, idents.EAPFlags, b)
 
+	// Keep the IFTIdentifier unique
+	c.IFTIdentifier++
+
 	// Then wrap the EAP packet in a IFT packet
-	ift := NewIFT(VendorTGC, iftCode, idents.IFTIdentifier, append(beUint32(Juniper1), eap.Encode()...))
-	nb, err := c.Conn.Write(ift.Encode())
+	ift := NewIFT(VendorTGC, iftCode, c.IFTIdentifier, append(beUint32(Juniper1), eap.Encode()...))
+	pkt := ift.Encode()
+
+	fmt.Fprintf(outputWriter, "%s Write [EAPTTLS]\n%s", c.direction, hex.Dump(pkt))
+	nb, err := c.Conn.Write(pkt)
 	if err != nil {
 		return 0, err
 	}
