@@ -7,19 +7,30 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/ThalesIgnite/crypto11"
 )
 
 var outputWriter io.Writer
 var keylogWriter io.Writer
-var tlsCert tls.Certificate
+var serverCert tls.Certificate
+var clientCert *tls.Certificate
+
 var keylogFilename = flag.String("keylog", "", "write tls keys to file")
 var outputFilename = flag.String("output", "", "set output file")
 var forwardAddress = flag.String("forward", "", "forward requests to")
+var flagUsePKCS11 = flag.Bool("pkcs11", false, "use pkcs11 for client certificate key")
+var flagClientCert = flag.String("client-cert", "", "path to client certificate, if used")
+var flagClientKey = flag.String("client-key", "", "path to client key, if used")
+var flagServerCert = flag.String("server-cert", "cert.pem", "path to server certificate")
+var flagServerKey = flag.String("server-key", "key.pem", "path to server key")
 
 const VendorJuniper = 0xa4c
 const VendorTGC = 0x5597
@@ -115,7 +126,16 @@ func (p *Proxy) SetupTTLSClient(packet []byte) error {
 	p.clientIdentCh <- ii
 
 	fmt.Fprintf(outputWriter, "Setting up client->server EAP-TTLS\n")
-	c := tls.Client(serverEAP, &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS12, DynamicRecordSizingDisabled: true})
+	config := &tls.Config{
+		InsecureSkipVerify:          true,
+		MaxVersion:                  tls.VersionTLS12,
+		DynamicRecordSizingDisabled: true,
+	}
+
+	if clientCert != nil {
+		config.Certificates = []tls.Certificate{*clientCert}
+	}
+	c := tls.Client(serverEAP, config)
 	err = c.Handshake()
 	if err != nil {
 		return err
@@ -153,7 +173,7 @@ func (p *Proxy) SetupTTLSServer(packet []byte) error {
 	p.serverIdentCh <- ii
 
 	cfg := &tls.Config{
-		Certificates:                []tls.Certificate{tlsCert},
+		Certificates:                []tls.Certificate{serverCert},
 		MaxVersion:                  tls.VersionTLS12,
 		DynamicRecordSizingDisabled: true,
 		ClientAuth:                  tls.RequestClientCert,
@@ -251,7 +271,15 @@ func (p *Proxy) Reader(direction communicationDir) error {
 func handleClient(clientConn net.Conn) error {
 	defer clientConn.Close()
 
-	config := tls.Config{KeyLogWriter: keylogWriter, InsecureSkipVerify: true}
+	config := tls.Config{
+		KeyLogWriter:       keylogWriter,
+		InsecureSkipVerify: true,
+	}
+
+	if clientCert != nil {
+		config.Certificates = []tls.Certificate{*clientCert}
+	}
+
 	serverConn, err := tls.Dial("tcp", *forwardAddress, &config)
 	if err != nil {
 		err = fmt.Errorf("error initializing TLS connection: %w", err)
@@ -309,12 +337,76 @@ func main() {
 		fmt.Println("Writing TLS keys to", *keylogFilename)
 	}
 
-	tlsCert, err = tls.LoadX509KeyPair("cert.pem", "key.pem")
+	serverCert, err = tls.LoadX509KeyPair(*flagServerCert, *flagServerKey)
 	if err != nil {
 		log.Fatalf("server: loadkeys: %s", err)
 	}
 
-	config := tls.Config{Certificates: []tls.Certificate{tlsCert}}
+	// Use client certificate when communicating upstream?
+	if *flagClientCert != "" {
+		var cc tls.Certificate
+		if !*flagUsePKCS11 {
+			cc, err = tls.LoadX509KeyPair(*flagClientCert, *flagClientKey)
+			if err != nil {
+				log.Fatalf("server: LoadX509KeyPair failed for client certificates: %s", err)
+			}
+		} else {
+			cc, err = LoadCertificate(*flagClientCert)
+			if err != nil {
+				log.Fatalf("server: LoadCertificate failed for client certificates: %s", err)
+			}
+
+			ctx, err := crypto11.ConfigureFromFile("pkcs11.conf")
+			if err != nil {
+				log.Printf("Cannot configure from file: %s", err)
+				return
+			}
+			defer ctx.Close()
+
+			keyPairs, err := ctx.FindAllKeyPairs()
+			if err != nil {
+				log.Printf("Cannot find all keyspairs: %s", err)
+				return
+			}
+
+			for _, kp := range keyPairs {
+				cc.PrivateKey = kp
+				fmt.Printf("publickey: %T %v\n", kp, kp)
+			}
+		}
+		clientCert = &cc
+		config := tls.Config{
+			InsecureSkipVerify: true,
+			Certificates:       []tls.Certificate{*clientCert},
+		}
+
+		client := &http.Client{
+			Transport: &http.Transport{
+				MaxIdleConns:       10,
+				IdleConnTimeout:    30 * time.Second,
+				DisableCompression: true,
+				TLSClientConfig:    &config,
+			},
+		}
+		resp, err := client.Get("https://test-navet.karolinska.se")
+		if err != nil {
+			log.Fatalf("client.Get: %s", err)
+		}
+
+		fmt.Println("Response", resp.StatusCode, resp.Status)
+		fmt.Println("Headers", resp.Header)
+
+		b, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			log.Fatalf("ioutil.ReadAll: %s", err)
+		}
+		fmt.Println("Body:\n", b)
+		return
+	}
+
+	config := tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	}
 	service := "0.0.0.0:443"
 	listener, err := tls.Listen("tcp", service, &config)
 	if err != nil {
